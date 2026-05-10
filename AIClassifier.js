@@ -3,8 +3,13 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 export class AIClassifier {
   constructor() {
     // Initialize Gemini API - in production, use environment variable
-    const apiKey = process.env.GEMINI_API_KEY || 'AIzaSyBfPtiYOJ5RRMqOrn59HY7S7e1F0_Yfpm0';
-    this.genAI = new GoogleGenerativeAI(apiKey);
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.warn('⚠️ GEMINI_API_KEY not found in environment; using heuristic classifier fallback.');
+      this.genAI = null;
+    } else {
+      this.genAI = new GoogleGenerativeAI(apiKey);
+    }
     // Defer creating the model until classify() to avoid throwing in constructor
     this.model = null;
     this.modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
@@ -118,6 +123,10 @@ export class AIClassifier {
    * @returns {Promise<Object>} Classification result with visualization metadata
    */
   async classify(code) {
+    if (!this.genAI) {
+      return this.fallbackClassification(code);
+    }
+
     const prompt = `
 You are an expert C++ algorithm analyzer and 3D visualization architect. Analyze the following C++ code and return a JSON object with EXACT structure (no markdown, no code blocks, pure JSON):
 
