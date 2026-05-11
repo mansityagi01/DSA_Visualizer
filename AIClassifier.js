@@ -125,6 +125,17 @@ export class AIClassifier {
     const fallback = () => buildFallbackActionScript(code);
     if (!this.genAI) return fallback();
 
+    // For common classroom-style patterns we already support deterministically,
+    // prefer the fallback planner to guarantee a complete, correct per-iteration
+    // timeline (no missing loop iterations, no "final value" leaking early).
+    const source = String(code || '');
+    const looksLikeBubbleSort = /arr\s*\[\s*j\s*\]\s*>\s*arr\s*\[\s*j\s*\+\s*1\s*\]/m.test(source)
+      || /\bbubble\s*sort\b/i.test(source);
+    const looksLikeSummation = /\b(sum|total)\s*\+=\s*\w+\s*\[\s*\w+\s*\]/m.test(source)
+      || /\w+\s*\+=\s*\w+\s*\[\s*\w+\s*\]/m.test(source);
+
+    if (looksLikeBubbleSort || looksLikeSummation) return fallback();
+
     const prompt = [
       'You are a C++ code execution script generator.',
       'Generate a COMPLETE step-by-step execution script for this C++ code.',
@@ -234,6 +245,14 @@ export class AIClassifier {
       const parsed = JSON.parse(text);
       if (!Array.isArray(parsed.steps) || parsed.steps.length === 0) {
         console.warn('⚠️ AI returned empty steps, using fallback');
+        return fallback();
+      }
+
+      // Validate that the AI script actually contains state snapshots for each step.
+      // Without `fullState`, the visualizer cannot faithfully show intermediate values.
+      const fullStateCount = parsed.steps.filter((step) => step && typeof step.fullState === 'object' && step.fullState !== null).length;
+      if (fullStateCount < Math.max(1, Math.floor(parsed.steps.length * 0.9))) {
+        console.warn('⚠️ AI script missing fullState snapshots, using fallback');
         return fallback();
       }
       

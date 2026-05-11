@@ -309,7 +309,10 @@ function buildBubbleSortScript(source, lines, arrays) {
   const swapLine = lineForPattern(lines, /temp\s*=\s*arr\s*\[\s*j\s*\]/m) || compareLine;
   const printLine = lineForPattern(lines, /cout\s*<</m) || lines.length;
 
-  const items = createArrayItems(arrName, array ? array.values : []);
+  // IMPORTANT: keep `items` aligned with the current array state as swaps happen.
+  // Otherwise comparisons for later passes can be computed against the original array,
+  // causing incorrect/missing iterations and even "undoing" swaps.
+  let items = createArrayItems(arrName, array ? array.values : []);
   state[arrName] = createScalar('int[]', items, { isArray: true, itemKind: 'number' });
 
   buildProgramStart(state, lines, steps, stepId);
@@ -341,10 +344,12 @@ function buildBubbleSortScript(source, lines, arrays) {
     }));
 
     for (let innerIndex = 0; innerIndex < items.length - outerIndex - 1; innerIndex += 1) {
+      // Compare using CURRENT items (post any prior swaps).
       const left = items[innerIndex].value;
       const right = items[innerIndex + 1].value;
       state.j = createScalar('int', innerIndex);
       state.comparison = createScalar('bool', left > right);
+      state.swapped = createScalar('bool', false);
 
       steps.push(createStep({
         stepId: stepId.value++,
@@ -366,6 +371,7 @@ function buildBubbleSortScript(source, lines, arrays) {
           item.index = index;
         });
         state[arrName] = createScalar('int[]', after, { isArray: true, itemKind: 'number' });
+        items = after;
         state.swapped = createScalar('bool', true);
 
         steps.push(createStep({

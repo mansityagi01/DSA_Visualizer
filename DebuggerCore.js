@@ -46,7 +46,6 @@ export class DebuggerCore {
     return new Promise((resolve) => {
       console.log('📊 Generating synthetic debug frames for visualization...');
       const plan = this.executionPlan || buildFallbackActionScript(this.sourceCode);
-      const delayBase = this.stepDelayMs;
       const frames = plan.steps || [];
       
       const emitFrame = (frame) => {
@@ -68,18 +67,23 @@ export class DebuggerCore {
       };
 
       if (frames.length > 0) {
-        const scheduleFrame = (frame, index) => {
+        let offsetMs = 0;
+        for (const frame of frames) {
+          const frameDelay = Number.isFinite(Number(frame?.durationMs))
+            ? Math.max(140, Number(frame.durationMs))
+            : this.stepDelayMs;
+
           setTimeout(() => {
             emitFrame(frame);
-          }, index * delayBase);
-        };
+          }, offsetMs);
 
-        frames.forEach(scheduleFrame);
+          offsetMs += frameDelay;
+        }
 
         setTimeout(() => {
           console.log('✅ Synthetic execution plan complete');
           resolve();
-        }, delayBase * frames.length + 10);
+        }, offsetMs + 10);
         return;
       }
 

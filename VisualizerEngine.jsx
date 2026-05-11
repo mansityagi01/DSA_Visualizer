@@ -409,7 +409,7 @@ function PointerOrb({ from, to, color = PALETTE.gold, label = '', isNull = false
 // ARRAY — train-coach style, connected cars with cute roofs
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ArrayCoach({ index, value, highlight = false, lifted = false, color, spacing = 1.8 }) {
+function ArrayCoach({ slotIndex, value, highlight = false, liftDir = 0, color, spacing = 1.8 }) {
   const meshRef = useRef();
   const [hovered, setHovered] = useState(false);
   useCursor(hovered);
@@ -420,9 +420,9 @@ function ArrayCoach({ index, value, highlight = false, lifted = false, color, sp
   });
 
   const { x, y, z } = useSpring({
-    x: index * spacing - 4,
-    y: lifted ? 0.65 : highlight ? 0.1 : 0,
-    z: lifted ? 0.2 : 0,
+    x: slotIndex * spacing - 4,
+    y: (liftDir ? 0.85 * Math.sign(liftDir) : 0) + (highlight ? 0.1 : 0),
+    z: liftDir ? 0.25 : 0,
     config: springConfig.stiff,
   });
 
@@ -461,7 +461,7 @@ function ArrayCoach({ index, value, highlight = false, lifted = false, color, sp
       ))}
 
       {/* Connector link to next coach */}
-      {index > 0 && (
+      {slotIndex > 0 && (
         <mesh position={[-0.9, 0, 0]}>
           <boxGeometry args={[0.3, 0.1, 0.08]} />
           <meshStandardMaterial color="#888" metalness={0.9} roughness={0.2} />
@@ -475,7 +475,7 @@ function ArrayCoach({ index, value, highlight = false, lifted = false, color, sp
       </mesh>
 
       {/* Index label */}
-      <Text position={[0, -0.9, 0]} fontSize={0.18} color="#aaa" anchorX="center">[{index}]</Text>
+      <Text position={[0, -0.9, 0]} fontSize={0.18} color="#aaa" anchorX="center">[{slotIndex}]</Text>
 
       {/* Value label */}
       <Text position={[0, 0.05, 0.5]} fontSize={0.28} color="white" anchorX="center" outlineColor={color} outlineWidth={0.02}>
@@ -527,29 +527,140 @@ function ArrayVisualizer({ variables, currentLine, currentFrame }) {
   const currentValue = getNumVar('currentValue');
 
   const [renderedArrays, setRenderedArrays] = useState({});
+  const [animByArray, setAnimByArray] = useState({});
+  const swapTimersRef = useRef([]);
+  const swapInFlightRef = useRef(false);
 
   useEffect(() => {
     setRenderedArrays((previous) => {
       const next = {};
+      for (const arr of arrays) {
+        // Keep a stable render order (do NOT reorder on swaps). Positions are animated separately.
+        const prevItems = previous[arr.name] || [];
+        const prevOrder = prevItems.map((item) => item.id);
+        const incomingById = new Map(arr.items.map((item) => [item.id, item]));
+
+        const merged = [];
+        for (const id of prevOrder) {
+          const incoming = incomingById.get(id);
+          if (incoming) merged.push({ id, value: incoming.value });
+        }
+        for (const item of arr.items) {
+          if (!prevOrder.includes(item.id)) merged.push({ id: item.id, value: item.value });
+        }
+
+        next[arr.name] = merged;
+      }
+      return next;
+    });
+  }, [arrays]);
+
+  // Initialize/sync slot positions for any newly-seen ids.
+  useEffect(() => {
+    setAnimByArray((previous) => {
+      const next = { ...previous };
 
       for (const arr of arrays) {
-        // Keep stable identities using the planner-provided ids.
-        // This allows smooth spring animations when items move (swap).
-        const prevItems = previous[arr.name] || [];
-        const prevById = new Map(prevItems.map((item) => [item.id, item]));
-        const matched = arr.items.map((item) => ({
-          id: item.id,
-          value: item.value,
-          // preserve any previous transient fields if we add them later
-          ...(prevById.get(item.id) || {}),
-        }));
+        const desiredOrder = arr.items.map((item) => item.id);
+        const prevEntry = next[arr.name] || { positions: {}, lifts: {} };
+        const positions = { ...(prevEntry.positions || {}) };
+        const lifts = { ...(prevEntry.lifts || {}) };
 
-        next[arr.name] = matched;
+        // Ensure each id has a position.
+        desiredOrder.forEach((id, idx) => {
+          if (typeof positions[id] !== 'number') positions[id] = idx;
+        });
+
+        // If no swap is in-flight, hard sync any drift to match the current array order.
+        if (!swapInFlightRef.current) {
+          desiredOrder.forEach((id, idx) => {
+            positions[id] = idx;
+          });
+        }
+
+        next[arr.name] = { positions, lifts };
       }
 
       return next;
     });
-  }, [arrays, currentFrame]);
+  }, [arrays]);
+
+  // Stage swap animation: lift (one up / one down) -> slide into swapped slots -> settle.
+  useEffect(() => {
+    if (!currentFrame || currentFrame.eventType !== 'SWAP') return;
+
+    const payload = currentFrame?.action?.payload;
+    const arrayName = payload?.arrayName;
+    const swapIndices = payload?.swapIndices;
+    const before = payload?.before;
+
+    if (!arrayName || !Array.isArray(swapIndices) || swapIndices.length !== 2 || !Array.isArray(before)) return;
+    const [aIndex, bIndex] = swapIndices;
+    const left = before?.[aIndex];
+    const right = before?.[bIndex];
+    const leftId = left?.id;
+    const rightId = right?.id;
+    if (!leftId || !rightId) return;
+
+    // Clear any previously scheduled swap timers.
+    swapTimersRef.current.forEach((timerId) => clearTimeout(timerId));
+    swapTimersRef.current = [];
+    swapInFlightRef.current = true;
+
+    const liftMs = 220;
+    const slideMs = 420;
+
+    // Stage 1: lift/dip
+    setAnimByArray((previous) => {
+      const entry = previous[arrayName] || { positions: {}, lifts: {} };
+      const positions = { ...(entry.positions || {}) };
+      const lifts = { ...(entry.lifts || {}) };
+
+      // Ensure they start at the pre-swap slots.
+      positions[leftId] = aIndex;
+      positions[rightId] = bIndex;
+
+      lifts[leftId] = +1;
+      lifts[rightId] = -1;
+
+      return { ...previous, [arrayName]: { positions, lifts } };
+    });
+
+    // Stage 2: slide into each other's slots (while lifted)
+    swapTimersRef.current.push(setTimeout(() => {
+      setAnimByArray((previous) => {
+        const entry = previous[arrayName] || { positions: {}, lifts: {} };
+        const positions = { ...(entry.positions || {}) };
+        const lifts = { ...(entry.lifts || {}) };
+
+        positions[leftId] = bIndex;
+        positions[rightId] = aIndex;
+
+        return { ...previous, [arrayName]: { positions, lifts } };
+      });
+    }, liftMs));
+
+    // Stage 3: settle
+    swapTimersRef.current.push(setTimeout(() => {
+      setAnimByArray((previous) => {
+        const entry = previous[arrayName] || { positions: {}, lifts: {} };
+        const positions = { ...(entry.positions || {}) };
+        const lifts = { ...(entry.lifts || {}) };
+
+        delete lifts[leftId];
+        delete lifts[rightId];
+
+        swapInFlightRef.current = false;
+        return { ...previous, [arrayName]: { positions, lifts } };
+      });
+    }, liftMs + slideMs));
+
+    return () => {
+      swapTimersRef.current.forEach((timerId) => clearTimeout(timerId));
+      swapTimersRef.current = [];
+      swapInFlightRef.current = false;
+    };
+  }, [currentFrame]);
 
   const swapIndicesFromAction = currentFrame?.eventType === 'SWAP'
     ? (currentFrame?.action?.payload?.swapIndices || null)
@@ -563,23 +674,49 @@ function ArrayVisualizer({ variables, currentLine, currentFrame }) {
           <Text position={[-4.5, 0.6, 0]} fontSize={0.3} color={PALETTE.primary} anchorX="left">
             {arr.name}[ ]
           </Text>
-          {(renderedArrays[arr.name] || arr.items).map((item, i) => (
-            <ArrayCoach
-              key={item.id}
-              index={i}
-              value={item.value}
-              color={DS_COLORS.ARRAY.base}
-              lifted={Boolean(
-                (Array.isArray(swapIndicesFromAction) && swapIndicesFromAction.includes(i))
-                || (Array.isArray(currentFrame?.stateDiff?.[arr.name]?.swap) && currentFrame.stateDiff[arr.name].swap.includes(i))
-              )}
-              highlight={
-                Number.isInteger(iValue)
-                  ? i === Math.max(0, Math.min(arr.items.length - 1, iValue))
-                  : (currentLine != null && arr.items.length > 0 && i === currentLine % arr.items.length)
-              }
-            />
-          ))}
+
+          {(() => {
+            const entry = animByArray[arr.name] || { positions: {}, lifts: {} };
+            const positions = entry.positions || {};
+            const lifts = entry.lifts || {};
+
+            const itemsToRender = renderedArrays[arr.name] || arr.items;
+
+            // Highlight the item currently at slot i (based on animated slot positions).
+            const highlightSlot = Number.isInteger(iValue)
+              ? Math.max(0, Math.min(arr.items.length - 1, iValue))
+              : null;
+            const highlightId = Number.isInteger(highlightSlot)
+              ? itemsToRender.find((it) => positions[it.id] === highlightSlot)?.id
+              : null;
+
+            return itemsToRender.map((item, fallbackIndex) => {
+              const slotIndex = Number.isFinite(positions[item.id]) ? positions[item.id] : fallbackIndex;
+              const liftDir = Number.isFinite(lifts[item.id]) ? lifts[item.id] : 0;
+
+              const liftedBySwapIndices = Boolean(
+                currentFrame?.eventType === 'SWAP'
+                && currentFrame?.action?.payload?.arrayName === arr.name
+                && Array.isArray(swapIndicesFromAction)
+                && swapIndicesFromAction.includes(slotIndex)
+              );
+
+              return (
+                <ArrayCoach
+                  key={item.id}
+                  slotIndex={slotIndex}
+                  value={item.value}
+                  color={DS_COLORS.ARRAY.base}
+                  liftDir={liftDir || (liftedBySwapIndices ? 1 : 0)}
+                  highlight={
+                    highlightId
+                      ? item.id === highlightId
+                      : (currentLine != null && arr.items.length > 0 && slotIndex === (currentLine % arr.items.length))
+                  }
+                />
+              );
+            });
+          })()}
 
           {/* Sum ball for summation loops: moves with i and shows running sum */}
           {Number.isInteger(iValue) && typeof sumValue === 'number' && arr.items.length > 0 && (
