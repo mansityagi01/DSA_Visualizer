@@ -86,6 +86,8 @@ io.on('connection', (socket) => {
 
       // Step 2: Use Gemini to classify the algorithm/data structure
       const classification = await sessionClassifier.classify(code);
+      const actionScript = await sessionClassifier.generateActionScript(code);
+      sessionDebugger.executionPlan = actionScript;
       
       socket.emit('classification:complete', {
         dataStructure: classification.dataStructure,
@@ -97,6 +99,7 @@ io.on('connection', (socket) => {
 
       socket.emit('compilation:success', {
         executablePath: compilationResult.executablePath,
+        executionPlan: actionScript,
         timestamp: Date.now()
       });
 
@@ -115,9 +118,14 @@ io.on('connection', (socket) => {
   // =====================================================================
   socket.on('debug:start', async (data) => {
     try {
-      socket.emit('status:update', { 
-        stage: 'debugging', 
-        message: '🐛 Launching GDB debugger...' 
+      const hasSyntheticTimeline = Array.isArray(sessionDebugger.executionPlan?.steps)
+        && sessionDebugger.executionPlan.steps.length > 0;
+
+      socket.emit('status:update', {
+        stage: 'debugging',
+        message: hasSyntheticTimeline
+          ? '🎬 Starting synthetic execution timeline...'
+          : '🐛 Launching GDB debugger...'
       });
 
       // Start GDB session and get line-by-line execution frames

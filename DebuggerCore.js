@@ -3,6 +3,7 @@ import { writeFileSync, unlinkSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
+import { buildFallbackActionScript } from './codeActionScript.js';
 
 export class DebuggerCore {
   constructor(sessionId) {
@@ -19,8 +20,11 @@ export class DebuggerCore {
     this.breakpoints = new Set();
     this.variableCache = new Map();
     this.frameHistory = [];
+    this.executionPlan = null;
     this.isRunning = false;
     this.callbacks = {};
+    this.sourceCode = '';
+    this.stepDelayMs = 2000; // 2s per step as requested
     
     // GDB prompt marker for parsing
     this.GDB_PROMPT = '(gdb) ';
@@ -41,76 +45,113 @@ export class DebuggerCore {
   async generateSyntheticFrames() {
     return new Promise((resolve) => {
       console.log('📊 Generating synthetic debug frames for visualization...');
-      const arr = [5, 2, 8, 1, 9, 3];
-      const originalArr = [...arr];
-      let delay = 100;
+      const plan = this.executionPlan || buildFallbackActionScript(this.sourceCode);
+      const delayBase = this.stepDelayMs;
+      const frames = plan.steps || [];
       
-      const emitFrame = (line, variables) => {
+      const emitFrame = (frame) => {
         if (this.callbacks.onFrame) {
           this.callbacks.onFrame({
-            line,
-            variables,
+            line: frame.line || 1,
+            executionLine: frame.executionLine || frame.line || 1,
+            eventType: frame.eventType,
+            phase: frame.phase,
+            description: frame.description,
+            animationHint: frame.animationHint,
+            action: frame.action,
+            keywords: frame.keywords,
+            stateDiff: frame.stateDiff,
+            variables: this.stateToFrameVariables(frame.fullState || {}),
             timestamp: Date.now()
           });
         }
       };
 
-      // Frame 1: Initial state
-      setTimeout(() => {
-        emitFrame(6, {
-          arr: { type: 'vector<int>', value: [...arr], isArray: true },
-          i: { type: 'int', value: 0 },
-          j: { type: 'int', value: 0 },
-          n: { type: 'int', value: arr.length }
-        });
-      }, delay);
-      delay += 200;
-
-      // Simulate bubble sort frames
-      for (let i = 0; i < arr.length - 1; i++) {
-        for (let j = 0; j < arr.length - i - 1; j++) {
+      if (frames.length > 0) {
+        const scheduleFrame = (frame, index) => {
           setTimeout(() => {
-            // Comparison frame
-            emitFrame(9, {
-              arr: { type: 'vector<int>', value: [...arr], isArray: true },
-              i: { type: 'int', value: i },
-              j: { type: 'int', value: j },
-              comparison: { type: 'bool', value: arr[j] > arr[j + 1] }
-            });
-          }, delay);
-          delay += 150;
+            emitFrame(frame);
+          }, index * delayBase);
+        };
 
-          if (arr[j] > arr[j + 1]) {
-            // Swap frame
-            setTimeout(() => {
-              [arr[j], arr[j + 1]] = [arr[j + 1], arr[j]];
-              emitFrame(10, {
-                arr: { type: 'vector<int>', value: [...arr], isArray: true },
-                i: { type: 'int', value: i },
-                j: { type: 'int', value: j },
-                swapped: { type: 'bool', value: true }
-              });
-            }, delay);
-            delay += 200;
-          }
-        }
+        frames.forEach(scheduleFrame);
+
+        setTimeout(() => {
+          console.log('✅ Synthetic execution plan complete');
+          resolve();
+        }, delayBase * frames.length + 10);
+        return;
       }
 
-      // Final state frame
-      setTimeout(() => {
-        emitFrame(24, {
-          arr: { type: 'vector<int>', value: arr, isArray: true },
-          sorted: { type: 'bool', value: true },
-          originalArr: { type: 'vector<int>', value: originalArr, isArray: true }
-        });
-      }, delay + 300);
-
-      // Resolve after all frames emitted
-      setTimeout(() => {
-        console.log('✅ Synthetic frames generation complete');
-        resolve();
-      }, delay + 400);
+      console.log('✅ No execution plan generated; no synthetic frames emitted');
+      resolve();
     });
+  }
+
+  stateToFrameVariables(state) {
+    const variables = {};
+    for (const [name, entry] of Object.entries(state || {})) {
+      if (entry && entry.isArray) {
+        variables[name] = {
+          type: entry.type || 'array',
+          value: Array.isArray(entry.value) ? [...entry.value] : [],
+          isArray: true,
+        };
+        continue;
+      }
+
+      if (entry && entry.isOutput) {
+        variables[name] = {
+          type: 'output',
+          value: entry.value,
+          isOutput: true,
+        };
+        continue;
+      }
+
+      if (entry && typeof entry.value !== 'undefined') {
+        variables[name] = {
+          type: entry.type || typeof entry.value,
+          value: entry.value,
+        };
+      }
+    }
+
+    return variables;
+  }
+
+  isSummationProgram() {
+    const code = this.sourceCode || '';
+    const hasSumUpdate = /sum\s*\+=\s*\w+\s*\[\s*\w+\s*\]/m.test(code);
+    const hasForLoop = /for\s*\(/m.test(code);
+    const hasArray = /int\s+\w+\s*\[\s*\]\s*=\s*\{[^}]*\}|vector\s*<\s*int\s*>\s*\w+\s*=\s*\{[^}]*\}/m.test(code);
+    return hasSumUpdate && hasForLoop && hasArray;
+  }
+
+  /**
+   * Extract an integer array from C++ source if present.
+   * Supports patterns like: int arr[] = {1,2,3}; and vector<int> arr = {1,2,3};
+   */
+  extractArrayFromSource() {
+    const code = this.sourceCode || '';
+    const patterns = [
+      /int\s+\w+\s*\[\s*\]\s*=\s*\{([^}]*)\}/m,
+      /vector\s*<\s*int\s*>\s*\w+\s*=\s*\{([^}]*)\}/m
+    ];
+
+    for (const re of patterns) {
+      const match = code.match(re);
+      if (match && match[1]) {
+        const values = match[1]
+          .split(',')
+          .map((v) => parseInt(v.trim(), 10))
+          .filter((n) => Number.isFinite(n));
+        if (values.length > 0) return values;
+      }
+    }
+
+    // Safe fallback
+    return [5, 2, 8, 1, 9, 3];
   }
 
   /**
@@ -171,6 +212,8 @@ export class DebuggerCore {
   async compile(code) {
     return new Promise((resolve, reject) => {
       try {
+        this.sourceCode = code;
+        this.executionPlan = buildFallbackActionScript(code);
         // Generate unique filenames
         const uniqueId = randomBytes(8).toString('hex');
         this.sourceFile = join(this.sessionDir, `program_${uniqueId}.cpp`);
@@ -251,6 +294,21 @@ export class DebuggerCore {
     this.callbacks = { onFrame, onError, onComplete };
     this.emptyFrameCount = 0;
     this.syntheticFallbackTriggered = false;
+
+    // Vision-aligned behavior: when we already have an execution plan that
+    // represents the step-by-step timeline, prefer emitting those steps as
+    // frames to drive the 3D visualizer (works even without GDB).
+    const shouldPreferSyntheticTimeline = Boolean(this.executionPlan?.shouldUseSyntheticTimeline)
+      || (Array.isArray(this.executionPlan?.steps) && this.executionPlan.steps.length > 0);
+
+    if (shouldPreferSyntheticTimeline) {
+      try {
+        await this.generateSyntheticFrames();
+      } finally {
+        if (this.callbacks.onComplete) this.callbacks.onComplete();
+      }
+      return;
+    }
     
     return new Promise((resolve, reject) => {
       try {
@@ -262,7 +320,10 @@ export class DebuggerCore {
             if (this.callbacks.onError) {
               this.callbacks.onError({ type: 'NO_EXECUTABLE', message: 'Executable missing', severity: 'warning' });
             }
-            resolve();
+            this.generateSyntheticFrames().then(() => {
+              if (this.callbacks.onComplete) this.callbacks.onComplete();
+              resolve();
+            }).catch(reject);
             return;
           }
 
@@ -464,7 +525,7 @@ export class DebuggerCore {
         clearInterval(stepInterval);
       }
       
-    }, 100); // 100ms between steps (adjustable for speed)
+    }, this.stepDelayMs); // 0.5s between steps
   }
 
   /**

@@ -409,27 +409,25 @@ function PointerOrb({ from, to, color = PALETTE.gold, label = '', isNull = false
 // ARRAY — train-coach style, connected cars with cute roofs
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ArrayCoach({ index, value, highlight = false, color, spacing = 1.8 }) {
+function ArrayCoach({ index, value, highlight = false, lifted = false, color, spacing = 1.8 }) {
   const meshRef = useRef();
   const [hovered, setHovered] = useState(false);
   useCursor(hovered);
 
-  const { scale, emissive } = useSpring({
+  const { scale } = useSpring({
     scale: highlight ? 1.18 : hovered ? 1.08 : 1,
-    emissive: highlight ? 1.4 : 0.4,
     config: springConfig.wobbly,
   });
 
-  useFrame(({ clock }) => {
-    if (meshRef.current && highlight) {
-      meshRef.current.position.y = Math.sin(clock.elapsedTime * 4 + index) * 0.08;
-    }
+  const { x, y, z } = useSpring({
+    x: index * spacing - 4,
+    y: lifted ? 0.65 : highlight ? 0.1 : 0,
+    z: lifted ? 0.2 : 0,
+    config: springConfig.stiff,
   });
 
-  const x = index * spacing - 4;
-
   return (
-    <group position={[x, 0, 0]}>
+    <animated.group position-x={x} position-y={y} position-z={z}>
       {/* Coach body */}
       <animated.mesh
         ref={meshRef}
@@ -486,22 +484,76 @@ function ArrayCoach({ index, value, highlight = false, color, spacing = 1.8 }) {
 
       {/* Glow */}
       {highlight && <Sparkles count={IS_DEV ? 4 : 10} scale={1.8} size={2} speed={0.3} color={color} />}
-    </group>
+    </animated.group>
   );
 }
 
-function ArrayVisualizer({ variables, currentLine }) {
+function ArrayVisualizer({ variables, currentLine, currentFrame }) {
   const arrays = useMemo(() => {
     const result = [];
     for (const [name, data] of Object.entries(variables || {})) {
       if (data.isArray && Array.isArray(data.value)) {
-        result.push({ name, values: data.value });
+        // Support both raw number arrays and array-item objects like:
+        // [{ id, index, value }, ...] which come from the action-script planner.
+        const normalized = data.value.map((entry, index) => {
+          if (entry && typeof entry === 'object') {
+            return {
+              id: entry.id || `${name}-${index}-${String(entry.value ?? '')}`,
+              value: typeof entry.value === 'number' ? entry.value : Number(entry.value),
+            };
+          }
+          return {
+            id: `${name}-${index}-${String(entry)}`,
+            value: typeof entry === 'number' ? entry : Number(entry),
+          };
+        }).filter((item) => Number.isFinite(item.value));
+
+        result.push({ name, items: normalized });
       }
     }
     return result;
   }, [variables]);
 
-  const colors = Object.values(DS_COLORS.ARRAY);
+  const getNumVar = useCallback((name) => {
+    const v = variables?.[name];
+    if (v == null) return null;
+    if (typeof v === 'number') return v;
+    if (typeof v?.value === 'number') return v.value;
+    return null;
+  }, [variables]);
+
+  const iValue = getNumVar('i');
+  const sumValue = getNumVar('sum');
+  const currentValue = getNumVar('currentValue');
+
+  const [renderedArrays, setRenderedArrays] = useState({});
+
+  useEffect(() => {
+    setRenderedArrays((previous) => {
+      const next = {};
+
+      for (const arr of arrays) {
+        // Keep stable identities using the planner-provided ids.
+        // This allows smooth spring animations when items move (swap).
+        const prevItems = previous[arr.name] || [];
+        const prevById = new Map(prevItems.map((item) => [item.id, item]));
+        const matched = arr.items.map((item) => ({
+          id: item.id,
+          value: item.value,
+          // preserve any previous transient fields if we add them later
+          ...(prevById.get(item.id) || {}),
+        }));
+
+        next[arr.name] = matched;
+      }
+
+      return next;
+    });
+  }, [arrays, currentFrame]);
+
+  const swapIndicesFromAction = currentFrame?.eventType === 'SWAP'
+    ? (currentFrame?.action?.payload?.swapIndices || null)
+    : null;
 
   return (
     <group>
@@ -511,20 +563,66 @@ function ArrayVisualizer({ variables, currentLine }) {
           <Text position={[-4.5, 0.6, 0]} fontSize={0.3} color={PALETTE.primary} anchorX="left">
             {arr.name}[ ]
           </Text>
-          {arr.values.map((val, i) => (
+          {(renderedArrays[arr.name] || arr.items).map((item, i) => (
             <ArrayCoach
-              key={i}
+              key={item.id}
               index={i}
-              value={val}
+              value={item.value}
               color={DS_COLORS.ARRAY.base}
-              highlight={currentLine != null && i === currentLine % arr.values.length}
+              lifted={Boolean(
+                (Array.isArray(swapIndicesFromAction) && swapIndicesFromAction.includes(i))
+                || (Array.isArray(currentFrame?.stateDiff?.[arr.name]?.swap) && currentFrame.stateDiff[arr.name].swap.includes(i))
+              )}
+              highlight={
+                Number.isInteger(iValue)
+                  ? i === Math.max(0, Math.min(arr.items.length - 1, iValue))
+                  : (currentLine != null && arr.items.length > 0 && i === currentLine % arr.items.length)
+              }
             />
           ))}
+
+          {/* Sum ball for summation loops: moves with i and shows running sum */}
+          {Number.isInteger(iValue) && typeof sumValue === 'number' && arr.items.length > 0 && (
+            <group position={[
+              Math.max(0, Math.min(arr.items.length - 1, iValue)) * 1.8 - 4,
+              1.55,
+              0
+            ]}>
+              <mesh>
+                <sphereGeometry args={[0.28, 20, 20]} />
+                <meshStandardMaterial
+                  color={PALETTE.accent}
+                  emissive={PALETTE.accent}
+                  emissiveIntensity={1.1}
+                  roughness={0.12}
+                  metalness={0.45}
+                />
+              </mesh>
+              <Text position={[0, 0.58, 0]} fontSize={0.2} color={PALETTE.accent} anchorX="center">
+                SUM: {sumValue}
+              </Text>
+              {typeof currentValue === 'number' && (
+                <Text position={[0, -0.52, 0]} fontSize={0.16} color={PALETTE.warning} anchorX="center">
+                  +{currentValue}
+                </Text>
+              )}
+              <Sparkles count={IS_DEV ? 5 : 12} scale={1.6} size={2} speed={0.35} color={PALETTE.accent} />
+            </group>
+          )}
           {/* Track rail */}
           <mesh position={[0, -0.65, 0]}>
-            <boxGeometry args={[arr.values.length * 1.8 + 0.5, 0.06, 0.12]} />
+            <boxGeometry args={[arr.items.length * 1.8 + 0.5, 0.06, 0.12]} />
             <meshStandardMaterial color="#444" metalness={0.8} roughness={0.3} />
           </mesh>
+
+          {/* Final result highlight for sum programs */}
+          {typeof sumValue === 'number' && Number.isInteger(iValue) && iValue >= arr.items.length && (
+            <Billboard position={[arr.items.length * 0.95 - 3.9, 1.9, 0]}>
+              <Text fontSize={0.26} color={PALETTE.accent} anchorX="center" outlineColor={PALETTE.accent} outlineWidth={0.012}>
+                FINAL SUM = {sumValue}
+              </Text>
+            </Billboard>
+          )}
         </group>
       ))}
     </group>
@@ -1410,7 +1508,7 @@ function DataStructureSwitch({ classification, currentFrame, errors }) {
         <ErrorPhysicsScene errors={errors} />
       ) : (
         <>
-          {ds === 'ARRAY'       && <ArrayVisualizer variables={vars} currentLine={currentFrame?.line} />}
+          {ds === 'ARRAY'       && <ArrayVisualizer variables={vars} currentLine={currentFrame?.line} currentFrame={currentFrame} />}
           {ds === 'LINKED_LIST' && <LinkedListVisualizer variables={vars} />}
           {ds === 'BINARY_TREE' && <BinaryTreeVisualizer variables={vars} />}
           {ds === 'GRAPH'       && <GraphVisualizer variables={vars} />}
@@ -1420,7 +1518,7 @@ function DataStructureSwitch({ classification, currentFrame, errors }) {
           {ds === 'TRIE'        && <TrieVisualizer />}
           {ds === 'HEAP'        && <HeapVisualizer variables={vars} />}
           {ds === 'WATER_JUG'   && <WaterJugVisualizer variables={vars} />}
-          {ds === 'CUSTOM'      && <ArrayVisualizer variables={vars} currentLine={currentFrame?.line} />}
+          {ds === 'CUSTOM'      && <ArrayVisualizer variables={vars} currentLine={currentFrame?.line} currentFrame={currentFrame} />}
           {!classification      && <IdleScene />}
         </>
       )}
@@ -1473,9 +1571,14 @@ export function VisualizerEngine({
   classification = null,
   errors = [],
   isDebugging = false,
+  executionPlan = null,
 }) {
   const ds = classification?.dataStructure;
   const colScheme = DS_COLORS[ds] || DS_COLORS.CUSTOM;
+  const activeAction = currentFrame?.action || executionPlan?.steps?.[0]?.action || null;
+  const planLabel = executionPlan
+    ? `${executionPlan.stepCount ?? executionPlan.steps?.length ?? 0} steps • ${Math.round((executionPlan.confidence || 0) * 100)}%`
+    : null;
 
   return (
     <div style={{ width: '100%', height: '100%', background: '#050310', position: 'relative' }}>
@@ -1514,6 +1617,16 @@ export function VisualizerEngine({
               </>
             )}
           </>
+        )}
+        {planLabel && (
+          <span style={{ color: PALETTE.warning }}>
+            {planLabel}
+          </span>
+        )}
+        {activeAction && (
+          <span style={{ color: PALETTE.accent }}>
+            {activeAction.keyword} → {activeAction.motion}
+          </span>
         )}
         {isDebugging && (
           <span style={{

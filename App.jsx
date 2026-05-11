@@ -39,6 +39,7 @@ export default function App() {
   const [compilationStatus, setCompilationStatus] = useState(null);
   const [currentFrame, setCurrentFrame] = useState(null);
   const [allFrames, setAllFrames] = useState([]);
+  const [executionPlan, setExecutionPlan] = useState(null);
   const [classification, setClassification] = useState(null);
   const [errors, setErrors] = useState([]);
   const [logs, setLogs] = useState([]);
@@ -57,6 +58,9 @@ export default function App() {
 
   // ==================== SOCKET CONNECTION ====================
   useEffect(() => {
+    let mounted = true;
+    let createdSocket = null;
+
     (async () => {
       const protocol = window.location.protocol;
       const host = window.location.hostname;
@@ -122,13 +126,19 @@ export default function App() {
 
       // wire up remaining handlers below by reusing the newSocket variable
 
-      setSocket(newSocket);
+      createdSocket = newSocket;
+      if (mounted) {
+        setSocket(newSocket);
+      }
     })();
     // NOTE: remaining socket handlers that depend on `socket` are defined
     // below in other effects and callbacks which react to `socket` state.
     // Cleanup will be handled by the socket state watcher.
     return () => {
-      if (socket) socket.disconnect();
+      mounted = false;
+      if (createdSocket) {
+        createdSocket.disconnect();
+      }
     };
   }, []);
 
@@ -150,6 +160,7 @@ export default function App() {
       setAllFrames([]);
       setCurrentFrame(null);
       setFrameIndex(0);
+      setExecutionPlan(data.executionPlan || null);
       addLog('🐛 Starting debug session...', 'info');
       socket.emit('debug:start', {});
     });
@@ -169,9 +180,14 @@ export default function App() {
     socket.on('debug:frame', (frame) => {
       setCurrentFrame(frame);
       setAllFrames(prev => [...prev, frame]);
-      setCurrentLine(frame.line);
-      highlightLine(frame.line);
-      addLog(`⏸️  Line ${frame.line}: ${Object.keys(frame.variables).length} vars`, 'debug');
+      const activeLine = frame.executionLine || frame.line;
+      setCurrentLine(activeLine);
+      highlightLine(activeLine);
+      if (frame.eventType) {
+        addLog(`⏸️  ${frame.eventType}: line ${frame.line}`, 'debug');
+      } else {
+        addLog(`⏸️  Line ${frame.line}: ${Object.keys(frame.variables).length} vars`, 'debug');
+      }
     });
 
     socket.on('debug:error', (error) => {
@@ -305,6 +321,7 @@ export default function App() {
     setCurrentFrame(null);
     setCurrentLine(null);
     setFrameIndex(0);
+    setExecutionPlan(null);
 
     addLog('🚀 Starting compilation...', 'info');
     socket.emit('compile:start', { code, language: 'cpp' });
@@ -320,6 +337,7 @@ export default function App() {
     setAllFrames([]);
     setCurrentFrame(null);
     setFrameIndex(0);
+    setExecutionPlan(null);
     addLog('🐛 Starting debug session...', 'info');
     socket.emit('debug:start', {});
   };
@@ -374,8 +392,9 @@ export default function App() {
         const nextIndex = prev + 1;
         const frame = allFrames[nextIndex];
         setCurrentFrame(frame);
-        setCurrentLine(frame.line);
-        highlightLine(frame.line);
+        const activeLine = frame.executionLine || frame.line;
+        setCurrentLine(activeLine);
+        highlightLine(activeLine);
         
         return nextIndex;
       });
@@ -420,8 +439,9 @@ export default function App() {
     const frame = allFrames[index];
     if (frame) {
       setCurrentFrame(frame);
-      setCurrentLine(frame.line);
-      highlightLine(frame.line);
+      const activeLine = frame.executionLine || frame.line;
+      setCurrentLine(activeLine);
+      highlightLine(activeLine);
     }
   };
 
@@ -436,7 +456,7 @@ export default function App() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 24px', backgroundColor: 'rgba(0,0,0,0.4)', borderBottom: '1px solid rgba(168, 85, 247, 0.3)' }}>
           <div className="flex items-center gap-4">
             <div className="text-2xl font-black bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
-              ⚡ LIVE 3D DEBUGGER
+              ⚡ LIVE EXECUTION STUDIO
             </div>
             <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`} />
             <span className="text-xs text-gray-400">
@@ -522,6 +542,25 @@ export default function App() {
             )}
           </div>
 
+          {executionPlan && (
+            <div className="px-4 pb-2 text-[11px] text-gray-300 flex flex-wrap gap-2 items-center">
+              <span className="text-cyan-300 font-semibold">Plan</span>
+              <span>{executionPlan.stepCount} steps</span>
+              <span className="text-gray-500">|</span>
+              <span>confidence {Math.round((executionPlan.confidence || 0) * 100)}%</span>
+              <span className="text-gray-500">|</span>
+              <span>{executionPlan.mode}</span>
+              {currentFrame?.action && (
+                <>
+                  <span className="text-gray-500">|</span>
+                  <span className="text-amber-300">
+                    {currentFrame.action.keyword} → {currentFrame.action.motion}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+
           {/* Compact Logs */}
           <div className="h-24 bg-black/60 overflow-y-auto p-2">
             <div className="space-y-1">
@@ -561,7 +600,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* 3D Canvas - Fills remaining space */}
+        {/* 3D visualizer canvas - fills remaining space */}
         <div style={{ flex: 1, width: '100%', height: '100%', minHeight: 0, position: 'relative' }}>
           <VisualizerEngine
             currentFrame={currentFrame}
@@ -569,6 +608,7 @@ export default function App() {
             classification={classification}
             errors={errors}
             isDebugging={isDebugging}
+            executionPlan={executionPlan}
           />
 
           {/* Info Overlay */}
